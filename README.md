@@ -2,45 +2,50 @@
 
 Plataforma web para localizar oportunidades de compras públicas compatíveis com pequenas e médias empresas brasileiras. A aplicação usa Python 3.10+ e SQLite, sem dependências externas de Python ou Node.
 
+## Acesso livre
+
+Não há cadastro, login, aprovação nem painel administrativo: qualquer pessoa abre a central e já vê as licitações. Nenhum dado pessoal é coletado ou guardado no servidor — os filtros escolhidos e as licitações salvas ficam apenas no navegador do visitante (`localStorage`).
+
 ## Executar localmente
 
 No PowerShell, na pasta do projeto:
 
 ```powershell
-$env:DEMO_MODE = "1"
 python server.py
 ```
 
-Abra `http://127.0.0.1:8000`. O banco SQLite é criado automaticamente em `data/licitara.db`.
-
-Contas locais de demonstração:
-
-- Empresa: `empresa@licitara.demo` / `EmpresaDemo#2026`
-- Administração: `admin@licitara.demo` / `AdminDemo#2026`
-
-Os exemplos exibidos quando o PNCP está indisponível são identificados visualmente como demonstração. Eles não são editais reais e seus documentos não são baixáveis.
+Abra `http://127.0.0.1:8000`. O banco SQLite é criado automaticamente em `data/licitara.db` e guarda somente o cache das oportunidades consultadas.
 
 ## Fontes e comportamento dos dados
 
-- A central consulta a operação oficial `GET /api/consulta/v1/contratacoes/proposta`, publicada pelo PNCP, que retorna contratações com recebimento de propostas aberto. O servidor envia `dataFinal` no formato `yyyyMMdd`, `pagina`, `tamanhoPagina=50` e, quando possível, UF ou código IBGE do município. A consulta e o JSON do Swagger foram verificados em `https://pncp.gov.br/pncp-consulta/v3/api-docs`.
-- Os itens usam a API pública oficial de dados do PNCP, `GET /api/pncp/v1/orgaos/{cnpj}/compras/{ano}/{sequencial}/itens`. Esse caminho pertence à API de dados (não à API de consulta), documentada em `https://pncp.gov.br/api/pncp/v3/api-docs` e validada com uma contratação real. Os itens ficam no SQLite após a consulta.
-- Os resultados são normalizados, filtrados, mantidos em cache por cinco minutos e persistidos no SQLite. Uma rotina em segundo plano renova a primeira página nacional a cada cinco minutos; filtros/páginas adicionais são carregados sob demanda.
-- Os itens são consultados sob demanda em `/v1/orgaos/{cnpj}/compras/{ano}/{sequencial}/itens`. A disponibilidade varia por contratação. Campos ausentes aparecem como “Não informado”; contagem de anexos não é presumida.
-- “Baixar edital” e “Site oficial” abrem a página oficial do PNCP, pois a rota de consulta de oportunidades não garante um URL direto para um PDF.
-- Não foi adicionada uma consulta cadastral automática do CNPJ: o cadastro valida o dígito verificador localmente e não depende de um serviço de terceiros ou credencial.
+- A central consulta a operação oficial `GET /api/consulta/v1/contratacoes/proposta`, publicada pelo PNCP, que retorna contratações com recebimento de propostas aberto. O servidor envia `dataFinal` no formato `yyyyMMdd` com uma janela de 15 dias (quem ainda vai encerrar propostas — usar a data de hoje devolvia só 221 editais no Brasil inteiro e esvaziava os filtros), `pagina`, `tamanhoPagina=50` e, quando há exatamente um estado selecionado, o UF. A consulta e o JSON do Swagger foram verificados em `https://pncp.gov.br/pncp-consulta/v3/api-docs`.
+- **Filtros de local:** cada estado selecionado é consultado individualmente (`uf`), em vez de filtrar uma única página nacional — por isso o filtro de estado realmente altera a lista. Regiões são expandidas para os estados correspondentes no servidor.
+- **Momento da licitação:** "Propostas abertas" usa `/v1/contratacoes/proposta` (padrão). "Licitações futuras" usa `/v1/contratacoes/publicacao` dos últimos 15 dias para Pregão Eletrônico, Concorrência Eletrônica, Concorrência Presencial, Pregão Presencial e Leilão Eletrônico, mantendo apenas as contratações cuja `dataAberturaProposta` ainda está no futuro. Se não houver nenhuma, a lista aparece vazia: exemplos nunca são inventados.
+- Os itens usam a API pública oficial de dados do PNCP, `GET /api/pncp/v1/orgaos/{cnpj}/compras/{ano}/{sequencial}/itens`, consultados sob demanda em `/v1/orgaos/{cnpj}/compras/{ano}/{sequencial}/itens`. A disponibilidade varia por contratação; campos ausentes aparecem como "Não informado".
+- Cada URL do PNCP fica em cache por cinco minutos; o botão "Atualizar" força uma nova consulta (a faixa mostra a hora real do dado) e a página se atualiza sozinha a cada 60 segundos enquanto estiver visível. Uma rotina em segundo plano renova propostas abertas e futuras a cada três minutos.
+- Se o PNCP ficar lento, cair ou limitar as requisições (429), o servidor responde com os últimos editais reais já salvos no SQLite e marca "PNCP sem resposta agora" — exemplos fictícios só aparecem quando não há nenhum dado real ainda.
+- **Produtos e serviços:** o filtro usa o índice de busca do próprio PNCP (`/api/search`), que pesquisa objeto **e itens** de todo o acervo — por isso um edital com objeto genérico ("aquisição de mobiliário") mas com "cadeira giratória" nos itens aparece. A consulta leva todas as palavras do item em uma frase e, quando há estados selecionados, é restrita a eles (`ufs`, um estado por consulta). Editais já conhecidos pelo servidor entram com prazos e valores oficiais; os demais entram com os dados do índice e "Encerramento: consultar no PNCP". Se o índice não responder, o servidor volta a varrer as páginas do PNCP e comparar o objeto do edital.
+- A busca livre (`q`) continua filtrando apenas os editais carregados na consulta atual, porque a rota de consulta do PNCP não expõe pesquisa textual.
+- "Baixar edital" baixa o arquivo publicado pelo órgão: o servidor lê os documentos oficiais da contratação, prefere o edital/aviso e devolve o arquivo como anexo (`Content-Disposition: attachment`), com limite de 30 MB e apenas endereços públicos. Quando o órgão não publica arquivo, a tela avisa e indica o botão "Site oficial".
+
+## API
+
+| Método | Rota | Observações |
+| --- | --- | --- |
+| GET | `/api/catalog` | Categorias e produtos usados nos filtros. |
+| GET | `/api/opportunities` | `q`, `state` (repetido), `region` (repetido), `city`, `period=open\|future`, `sort=date\|value`, `page`, `product` (repetido), `refresh=1`, `min_value`. |
+| GET | `/api/opportunities/{id}/items` | Itens e documentos oficiais da contratação. |
+| GET | `/api/opportunities/{id}/download` | Baixa o arquivo do edital publicado pelo órgão (anexo). |
+| POST | `/api/chat` | `{"message": "...", "products": ["..."]}`. Sem conta e sem histórico persistido. |
 
 ## Produção
 
-Antes de disponibilizar o serviço publicamente:
+1. Sirva atrás de um proxy HTTPS e defina `HOST`/`PORT` conforme a infraestrutura.
+2. Aplique limites de taxa no proxy: o servidor já espaça as chamadas ao PNCP em 1s, usa cache de cinco minutos e serve dados salvos quando a fonte falha, mas continua sendo um único processo.
+3. Inclua backups do SQLite no processo operacional. O banco contém apenas cache de dados públicos.
+4. Opcionalmente configure `OPENAI_API_KEY` e `OPENAI_MODEL`. O servidor envia à API de IA apenas a pergunta e até cinco registros PNCP recuperados. Sem a chave, o chat usa busca determinística nos registros oficiais persistidos.
 
-1. Configure `DEMO_MODE=0`. Isso impede a criação das contas de demonstração.
-2. Defina `ADMIN_EMAIL`, `ADMIN_PASSWORD` (mínimo de 12 caracteres) e, opcionalmente, `ADMIN_NAME` para criar o primeiro administrador. A inicialização só cria esse usuário se ainda não existir.
-3. Defina `COOKIE_SECURE=1` e publique atrás de um proxy HTTPS. Para acesso externo, configure o host conforme a infraestrutura e restrinja o banco e os segredos ao servidor.
-4. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` e `SMTP_FROM` para enviar mensagens de aprovação e rejeição. Sem SMTP, o sistema registra cada aviso na área administrativa, mas não consegue entregá-lo por e-mail.
-5. Defina uma chave forte para SQLite com permissões restritas no disco e inclua backups/monitoramento no processo operacional. Para múltiplas instâncias concorrentes, migre o banco SQLite para PostgreSQL e use um servidor WSGI/ASGI e proxy apropriados.
-6. Opcionalmente configure `OPENAI_API_KEY` e `OPENAI_MODEL`. O servidor envia à API de IA apenas a pergunta, produtos da empresa e até cinco registros PNCP recuperados. Sem a chave, o chat usa busca determinística nos registros oficiais persistidos.
-
-O modo de demonstração, o servidor HTTP embutido e o SQLite foram pensados para desenvolvimento e validação local, não como substitutos de hardening, observabilidade, backups e infraestrutura de produção.
+Na primeira inicialização, tabelas da versão com contas (`users`, `companies`, `sessions`, `approval_history`, `notifications`, `chat_history`) são removidas do banco local, já que o acesso não usa mais contas.
 
 ## Testes
 
@@ -48,4 +53,4 @@ O modo de demonstração, o servidor HTTP embutido e o SQLite foram pensados par
 python -m unittest discover -s tests -v
 ```
 
-Os testes cobrem validação do CNPJ, autenticação, cadastro pendente, isolamento de privilégios e liberação do acesso após aprovação.
+Os testes cobrem o acesso público às oportunidades, o repasse dos filtros para a API do PNCP, a consulta por estado, o filtro de licitações futuras, os itens sob demanda e o chat sem conta.
