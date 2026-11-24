@@ -28,9 +28,15 @@ API_REQUEST_LOCK = threading.Lock()
 LAST_API_REQUEST = 0.0
 API_MIN_INTERVAL = 1.0
 RATE_LIMIT_UNTIL = 0.0
+# Quando a rota de propostas abertas falha, ela fica de castigo por um minuto
+# para a página não esperar o tempo limite em cada acesso.
+PROPOSTA_DOWN_UNTIL = 0.0
 FETCH_STATE = threading.local()
 PAGE_SIZE = 50
 FUTURE_WINDOW_DAYS = 15
+# Janela usada quando a rota de propostas abertas não responde: publicações
+# recentes, que o PNCP serve por outra operação oficial.
+FALLBACK_WINDOW_DAYS = 7
 # O PNCP filtra propostas pelo encerramento: sem janela, a consulta com a data
 # de hoje devolvia só quem fechava hoje e os filtros ficavam vazios.
 OPEN_WINDOW_DAYS = 15
@@ -236,7 +242,7 @@ def fetch_json(url):
         if RATE_LIMIT_UNTIL > time.time():
             raise urllib.error.URLError("PNCP em limite de requisições")
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(request, timeout=8) as response:
                 raw = response.read().decode("utf-8", errors="replace").strip()
             return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as exc:
@@ -477,6 +483,10 @@ def proposta_page(uf, page, refresh):
     consulta devolvia apenas 221 editais no Brasil inteiro (8 em SC), o que
     esvaziava busca, produtos e filtros por estado.
     """
+    if PROPOSTA_DOWN_UNTIL > time.time():
+        # Falhou há pouco: nem tenta de novo agora, quem chama usa a rota de
+        # publicações recentes.
+        raise urllib.error.URLError("Rota de propostas abertas em falha recente")
     final = (date.today() + timedelta(days=OPEN_WINDOW_DAYS)).strftime("%Y%m%d")
     query = {"dataFinal": final, "pagina": page, "tamanhoPagina": PAGE_SIZE}
     if uf:
@@ -489,22 +499,28 @@ def collect_proposta_pages(states, first_page, page_count, refresh):
     tasks = [(uf, number) for uf in (states or [None]) for number in range(first_page, first_page + page_count)]
 
     def run(task):
+        global PROPOSTA_DOWN_UNTIL
         uf, number = task
         try:
             payload, stamp = proposta_page(uf, number, refresh)
         except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-            return task, [], 0, 1, None
+            PROPOSTA_DOWN_UNTIL = time.time() + 60
+            return task, [], 0, 1, None, False
         return (task, payload.get("data") or [], int(payload.get("totalRegistros") or 0),
-                int(payload.get("totalPaginas") or 1), stamp)
+                int(payload.get("totalPaginas") or 1), stamp, True)
 
     with ThreadPoolExecutor(max_workers=max(1, min(6, len(tasks)))) as pool:
         results = list(pool.map(run, tasks))
     results.sort(key=lambda item: (item[0][0] or "", item[0][1]))
     return results
 
-def future_records(states, refresh):
-    """Contratações publicadas recentemente cujo recebimento de propostas ainda vai abrir."""
-    start = (date.today() - timedelta(days=FUTURE_WINDOW_DAYS)).strftime("%Y%m%d")
+def future_records(states, refresh, days=FUTURE_WINDOW_DAYS):
+    """Contratações publicadas nos últimos dias, por modalidade.
+
+    Serve às licitações futuras e também de reserva quando a rota de propostas
+    abertas não responde.
+    """
+    start = (date.today() - timedelta(days=days)).strftime("%Y%m%d")
     end = date.today().strftime("%Y%m%d")
 
     def fetch(code):
@@ -523,11 +539,16 @@ def future_records(states, refresh):
         batches = list(pool.map(fetch, [code for code, _name in FUTURE_MODALITIES]))
     records = [record for batch, _stamps in batches for record in batch]
     stamps = [stamp for _batch, batch_stamps in batches for stamp in batch_stamps]
+    if not stamps:
+        # Nenhuma modalidade respondeu: quem chama precisa saber da falha para
+        # mostrar os editais já salvos em vez de uma lista vazia.
+        raise urllib.error.URLError("PNCP não respondeu à consulta de licitações futuras")
     return records, stamps
 
 
 def fetch_opportunities(params):
     FETCH_STATE.stale = False
+    FETCH_STATE.fallback = False
     period = params.get("period") if params.get("period") in PERIODS else "open"
     page = max(1, min(50, int(params.get("page") or 1)))
     states = sorted({clean(s).upper() for s in params.get("states") or [] if clean(s).upper() in VALID_UFS})
@@ -576,14 +597,30 @@ def fetch_opportunities(params):
             first_page, page_count = page, 1
         totals = {}
         raw = []
-        for (_uf, _number), data, total_records, total_pages, stamp in collect_proposta_pages(
-                states, first_page, page_count, refresh):
-            if stamp:
-                stamps.append(stamp)
-            totals.setdefault(_uf, total_records)
-            pages = max(pages, total_pages)
-            raw.extend(normalize(record) for record in data)
-        available = sum(totals.values())
+        answered = 0
+        try:
+            for (_uf, _number), data, total_records, total_pages, stamp, ok in collect_proposta_pages(
+                    states, first_page, page_count, refresh):
+                if ok:
+                    answered += 1
+                if stamp:
+                    stamps.append(stamp)
+                totals.setdefault(_uf, total_records)
+                pages = max(pages, total_pages)
+                raw.extend(normalize(record) for record in data)
+            if not answered:
+                # Todas as páginas falharam (429, 403, rede bloqueada ou PNCP
+                # fora do ar). Antes a falha era engolida página a página e o
+                # site mostrava "nenhuma oportunidade" mesmo havendo milhares.
+                raise urllib.error.URLError("PNCP não respondeu à consulta de propostas")
+        except (urllib.error.URLError, TimeoutError, OSError):
+            # Reserva oficial: contratações publicadas nos últimos dias, que o
+            # PNCP serve por outra operação e costuma manter no ar.
+            raw, stamps = future_records(states, refresh, days=FALLBACK_WINDOW_DAYS)
+            available = len(raw)
+            FETCH_STATE.fallback = True
+        else:
+            available = sum(totals.values())
 
     seen = set()
     unique = []
@@ -649,10 +686,16 @@ def fetch_opportunities(params):
         total = available or len(records)
 
     data_stamp = max(stamps) if stamps else time.time()
-    return {"opportunities": page_records, "total": total, "page": page, "pages": pages,
-            "period": period, "source": "PNCP",
-            "stale": bool(getattr(FETCH_STATE, "stale", False)),
-            "updated_at": datetime.fromtimestamp(data_stamp).isoformat(timespec="seconds")}
+    fallback = bool(getattr(FETCH_STATE, "fallback", False))
+    payload = {"opportunities": page_records, "total": total, "page": page, "pages": pages,
+               "period": period, "source": "PNCP (publicações recentes)" if fallback else "PNCP",
+               "stale": bool(getattr(FETCH_STATE, "stale", False)), "fallback": fallback,
+               "updated_at": datetime.fromtimestamp(data_stamp).isoformat(timespec="seconds")}
+    if fallback:
+        payload["warning"] = ("A consulta de propostas abertas do PNCP não respondeu agora. "
+                              f"Exibindo as contratações publicadas nos últimos {FALLBACK_WINDOW_DAYS} dias, "
+                              "com as datas oficiais de cada uma.")
+    return payload
 
 def persist_opportunities(records):
     with connect() as db:
@@ -1204,10 +1247,14 @@ class Handler(BaseHTTPRequestHandler):
             except (urllib.error.URLError, TimeoutError, ValueError, KeyError, OSError):
                 stored = stored_result(params)
                 if stored["total"]:
-                    stored["warning"] = "O PNCP está lento ou fora do ar agora. Exibindo os editais reais já consultados e salvos no servidor."
+                    stored["warning"] = ("O PNCP está lento, limitando as consultas ou fora do ar agora. "
+                                         "Exibindo os editais reais já consultados e salvos neste computador; "
+                                         "use Atualizar em alguns instantes.")
                     return self.send_json(200, stored)
                 result = demo_result(params)
-                result["warning"] = "Não foi possível consultar o PNCP agora. Exibindo exemplos identificados como demonstração."
+                result["warning"] = ("Não foi possível consultar o PNCP agora (limite de requisições, rede ou fonte fora do ar). "
+                                     "Os cards abaixo são exemplos fictícios de demonstração; use Atualizar em alguns instantes "
+                                     "para tentar os dados oficiais de novo.")
                 return self.send_json(200, result)
         if path.startswith("/api/opportunities/") and path.endswith("/download"):
             item_id = urllib.parse.unquote(path[len("/api/opportunities/"):-len("/download")].strip("/"))
@@ -1402,6 +1449,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def warm_pncp_cache():
     """Mantém o cache quente para o site responder na hora, inclusive em tempo real."""
+    # Espera a primeira página carregar: aquecer junto com o primeiro acesso só
+    # dividia o limite de requisições do PNCP e deixava a tela lenta.
+    time.sleep(10)
     while True:
         for period in ("open", "future"):
             try:

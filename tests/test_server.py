@@ -20,6 +20,7 @@ class PublicApiTests(unittest.TestCase):
         server.API_CACHE.clear()
         server.ITEMS_CACHE.clear()
         server.INDEX_CACHE.clear()
+        server.PROPOSTA_DOWN_UNTIL = 0.0
         server.init_db()
         self.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -33,6 +34,7 @@ class PublicApiTests(unittest.TestCase):
         self.thread.join(timeout=3)
         server.DB_PATH = self.old_db_path
         server.API_CACHE.clear()
+        server.PROPOSTA_DOWN_UNTIL = 0.0
         self.temp_dir.cleanup()
 
     def request(self, path, payload=None):
@@ -97,6 +99,39 @@ class PublicApiTests(unittest.TestCase):
             result = server.fetch_opportunities({"period": "future", "products": [], "sort": "date"})
         self.assertEqual([x["id"] for x in result["opportunities"]], ["111-1-1/2026"])
         self.assertEqual(result["period"], "future")
+
+    def test_pncp_limit_never_becomes_a_silent_empty_list(self):
+        with patch.object(server, "cached_json", side_effect=urllib.error.URLError("limite")):
+            with self.assertRaises(urllib.error.URLError):
+                server.fetch_opportunities({"products": [], "sort": "date", "page": 1})
+            status, result = self.request("/api/opportunities?period=open&page=1")
+        self.assertEqual(status, 200, result)
+        self.assertIn("warning", result)
+        self.assertTrue(result.get("demo") or result.get("stale"), result)
+
+    def test_open_search_falls_back_to_recent_publications(self):
+        soon = (datetime.now() + timedelta(days=5)).isoformat(timespec="seconds")
+        record = {"numeroControlePNCP": "555-1-9/2026", "objetoCompra": "Objeto recente",
+                  "modalidadeNome": "Pregão Eletrônico", "dataAberturaProposta": soon,
+                  "dataEncerramentoProposta": soon, "valorTotalEstimado": 10.0,
+                  "orgaoEntidade": {"razaoSocial": "Órgão", "cnpj": "555"},
+                  "unidadeOrgao": {"ufSigla": "SC", "municipioNome": "Florianópolis"}}
+
+        def fake_fetch(url):
+            if "contratacoes/proposta" in url:
+                raise urllib.error.URLError("sem resposta")
+            return {"data": [record], "totalRegistros": 1, "totalPaginas": 1}
+
+        with patch.object(server, "fetch_json", side_effect=fake_fetch):
+            result = server.fetch_opportunities({"products": [], "sort": "date", "page": 1})
+        self.assertTrue(result["fallback"], result)
+        self.assertEqual([r["id"] for r in result["opportunities"]], ["555-1-9/2026"])
+        self.assertIn("warning", result)
+
+    def test_future_search_reports_a_pncp_failure(self):
+        with patch.object(server, "cached_json", side_effect=urllib.error.URLError("limite")):
+            with self.assertRaises(urllib.error.URLError):
+                server.future_records([], False)
 
     def test_items_endpoint_is_public(self):
         item_id = "11222333000181-1-123/2026"

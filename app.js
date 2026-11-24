@@ -120,8 +120,8 @@ async function loadOpportunities(force=false,quiet=false){
     state.pages=result.pages||1;
     state.total=typeof result.total==="number"?result.total:state.opportunities.length;
     const banner=$("#source-label").closest(".source-banner");
-    $("#source-label").textContent=result.demo?"Exemplos de demonstração · PNCP indisponível":result.stale?"PNCP sem resposta agora · exibindo a última consulta":state.period==="future"?"Licitações futuras · abertura de propostas adiante":"Dados oficiais consultados no PNCP";
-    banner.classList.toggle("demo-banner",!!(result.demo||result.stale));
+    $("#source-label").textContent=result.demo?"Exemplos de demonstração · PNCP indisponível":result.fallback?"PNCP instável · contratações publicadas recentemente":result.stale?"PNCP sem resposta agora · exibindo a última consulta":state.period==="future"?"Licitações futuras · abertura de propostas adiante":"Dados oficiais consultados no PNCP";
+    banner.classList.toggle("demo-banner",!!(result.demo||result.stale||result.fallback));
     $("#source-updated").textContent=result.updated_at?`Dados de ${new Date(result.updated_at).toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit",second:"2-digit"})}`:"";
     banner.title=result.warning||"A lista se atualiza sozinha a cada minuto. O PNCP é reconsultado em segundo plano a cada 3 minutos; use Atualizar para forçar agora.";
     if(result.warning)toast(result.warning,"error");
