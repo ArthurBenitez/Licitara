@@ -34,9 +34,35 @@ PROPOSTA_DOWN_UNTIL = 0.0
 FETCH_STATE = threading.local()
 PAGE_SIZE = 50
 FUTURE_WINDOW_DAYS = 15
-# Janela usada quando a rota de propostas abertas não responde: publicações
-# recentes, que o PNCP serve por outra operação oficial.
+# A rota de propostas abertas cai com frequência. A reserva oficial
+# (v1/contratacoes/publicacao) entrega 50 registros por página e o PNCP limita
+# o IP, então as contratações recentes são coletadas em segundo plano e
+# acumuladas aqui: sem isso a tela mostrava apenas as primeiras ~250.
+# Consultar vários dias de uma vez devolve as publicações mais antigas primeiro
+# (só 16 em 50 ainda recebiam propostas); por isso a coleta pergunta um dia por
+# vez, começando hoje, onde praticamente todas as contratações estão abertas.
 FALLBACK_WINDOW_DAYS = 7
+# Pregão Eletrônico, Dispensa, Inexigibilidade, Concorrências, Pregão
+# Presencial e Leilão. Dispensa e Inexigibilidade são as de maior volume.
+FALLBACK_MODALITIES = (6, 8, 9, 4, 5, 7, 1)
+FALLBACK_PAGES = 12
+FALLBACK_TARGET = 4000
+FALLBACK_MIN_READY = 200
+# O PNCP responde 429 quando as requisições chegam a cada segundo; ~3 s entre
+# elas é o ritmo que a coleta sustenta sem parar o site inteiro.
+FALLBACK_PACE = 3.0
+# Hoje primeiro, página 1 de todas as modalidades, depois as páginas
+# seguintes e só então o dia anterior.
+FALLBACK_QUEUE = tuple((back, code, page) for back in range(FALLBACK_WINDOW_DAYS)
+                       for page in range(1, FALLBACK_PAGES + 1)
+                       for code in FALLBACK_MODALITIES)
+FALLBACK_STORE = {}
+FALLBACK_LOCK = threading.Lock()
+FALLBACK_CURSOR = 0
+FALLBACK_STAMP = 0.0
+FALLBACK_LAST_NEEDED = 0.0
+FALLBACK_PASS_DONE = 0.0
+FALLBACK_SEEDED = False
 # O PNCP filtra propostas pelo encerramento: sem janela, a consulta com a data
 # de hoje devolvia só quem fechava hoje e os filtros ficavam vazios.
 OPEN_WINDOW_DAYS = 15
@@ -514,11 +540,150 @@ def collect_proposta_pages(states, first_page, page_count, refresh):
     results.sort(key=lambda item: (item[0][0] or "", item[0][1]))
     return results
 
-def future_records(states, refresh, days=FUTURE_WINDOW_DAYS):
-    """Contratações publicadas nos últimos dias, por modalidade.
+def publicacao_page(code, page, back=0):
+    """Uma página das contratações publicadas no dia `back` (0 = hoje)."""
+    day = (date.today() - timedelta(days=back)).strftime("%Y%m%d")
+    query = {"dataInicial": day, "dataFinal": day, "codigoModalidadeContratacao": code,
+             "pagina": page, "tamanhoPagina": PAGE_SIZE}
+    payload, stamp = cached_json(PNCP_BASE + "/v1/contratacoes/publicacao?"
+                                 + urllib.parse.urlencode(query))
+    return [normalize(record) for record in payload.get("data") or []], stamp
 
-    Serve às licitações futuras e também de reserva quando a rota de propostas
-    abertas não responde.
+
+def remember_fallback(records):
+    """Acumula os editais recentes já baixados; o coletor só acrescenta novidades."""
+    fresh = []
+    with FALLBACK_LOCK:
+        for record in records:
+            if record["id"] not in FALLBACK_STORE:
+                FALLBACK_STORE[record["id"]] = record
+                fresh.append(record)
+        if len(FALLBACK_STORE) > FALLBACK_TARGET:
+            # Mantém as publicações mais novas: as antigas já encerraram.
+            ordered = sorted(FALLBACK_STORE.values(),
+                             key=lambda r: r.get("publicacao") or "", reverse=True)
+            FALLBACK_STORE.clear()
+            FALLBACK_STORE.update({r["id"]: r for r in ordered[:FALLBACK_TARGET]})
+    if fresh:
+        persist_opportunities(fresh)
+    return len(fresh)
+
+
+def collect_fallback_pages(seconds=80.0, max_requests=18):
+    """Aprofunda a reserva dentro do orçamento do ciclo.
+
+    Cada página traz 50 contratações e o PNCP corta quem pede a cada segundo:
+    respeitar FALLBACK_PACE é o que permite acumular milhares em segundo plano
+    em vez de tomar 429 e ficar com as ~250 da primeira passada.
+    """
+    global FALLBACK_CURSOR, FALLBACK_STAMP
+    started = time.time()
+    index = FALLBACK_CURSOR
+    requests_made = 0
+    failures = 0
+    while index < len(FALLBACK_QUEUE):
+        if requests_made >= max_requests or time.time() - started > seconds:
+            break
+        if RATE_LIMIT_UNTIL > time.time():
+            # O PNCP pediu pausa: o ciclo termina e o coletor espera.
+            break
+        back, code, page = FALLBACK_QUEUE[index]
+        attempt_started = time.time()
+        try:
+            records, stamp = publicacao_page(code, page, back)
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+            if RATE_LIMIT_UNTIL > time.time():
+                # 429 do PNCP: pausa e tenta a MESMA página, senão a coleta
+                # pula justamente as oportunidades que ainda faltavam.
+                wait = max(8.0, RATE_LIMIT_UNTIL - time.time())
+                if time.time() - started + wait > seconds:
+                    break
+                time.sleep(wait)
+                continue
+            failures += 1
+            index += 1
+            if failures >= 3:
+                break
+            continue
+        requests_made += 1
+        failures = 0
+        remember_fallback(records)
+        if stamp:
+            FALLBACK_STAMP = stamp
+        index += 1
+        wait = FALLBACK_PACE - (time.time() - attempt_started)
+        if wait > 0:
+            time.sleep(wait)
+    FALLBACK_CURSOR = index
+    return requests_made
+
+
+def seed_fallback_from_db():
+    """Recomeça de onde parou: a reserva coletada antes fica gravada no SQLite."""
+    global FALLBACK_SEEDED
+    if FALLBACK_SEEDED:
+        return
+    FALLBACK_SEEDED = True
+    try:
+        stored, _latest = stored_snapshot()
+    except (sqlite3.Error, OSError):
+        return
+    with FALLBACK_LOCK:
+        for record in stored:
+            if record.get("id"):
+                FALLBACK_STORE.setdefault(record["id"], record)
+
+
+def fallback_records(states, _refresh):
+    """Reserva: contratações recentes já coletadas, ampliadas em segundo plano."""
+    global FALLBACK_LAST_NEEDED
+    FALLBACK_LAST_NEEDED = time.time()
+    seed_fallback_from_db()
+    with FALLBACK_LOCK:
+        ready = len(FALLBACK_STORE)
+    if ready < FALLBACK_MIN_READY:
+        # Clone novo, banco vazio: semeia agora para a tela não abrir quase vazia.
+        collect_fallback_pages(seconds=14.0, max_requests=4)
+    with FALLBACK_LOCK:
+        records = list(FALLBACK_STORE.values())
+    if not records:
+        raise urllib.error.URLError("PNCP não respondeu à consulta de publicações recentes")
+    return records, [FALLBACK_STAMP or time.time()]
+
+
+def fallback_collector():
+    """Mantém milhares de contratações recentes enquanto a rota principal está fora."""
+    global FALLBACK_CURSOR, FALLBACK_PASS_DONE
+    time.sleep(15)
+    while True:
+        with FALLBACK_LOCK:
+            size = len(FALLBACK_STORE)
+        in_use = time.time() - FALLBACK_LAST_NEEDED < 1800
+        if not in_use or size >= FALLBACK_TARGET:
+            time.sleep(30)
+            continue
+        if FALLBACK_CURSOR >= len(FALLBACK_QUEUE):
+            # Passou por todas as páginas: recomeça depois de meia hora para
+            # pegar o que foi publicado nesse meio-tempo.
+            if time.time() - FALLBACK_PASS_DONE < 1800:
+                time.sleep(30)
+                continue
+            FALLBACK_CURSOR = 0
+        collect_fallback_pages(seconds=90.0, max_requests=18)
+        if FALLBACK_CURSOR >= len(FALLBACK_QUEUE):
+            FALLBACK_PASS_DONE = time.time()
+        if RATE_LIMIT_UNTIL > time.time():
+            # O limite é do IP inteiro: o coletor cede a vez para a página,
+            # os itens e o download do edital enquanto o PNCP pede pausa.
+            time.sleep(max(20.0, RATE_LIMIT_UNTIL - time.time()))
+        time.sleep(5)
+
+
+def future_records(states, refresh, days=FUTURE_WINDOW_DAYS):
+    """Contratações publicadas nos últimos dias, por modalidade (licitações futuras).
+
+    A reserva da tela de propostas abertas é outra: usa fallback_records, que
+    acumula os editais dia a dia em segundo plano.
     """
     start = (date.today() - timedelta(days=days)).strftime("%Y%m%d")
     end = date.today().strftime("%Y%m%d")
@@ -616,7 +781,7 @@ def fetch_opportunities(params):
         except (urllib.error.URLError, TimeoutError, OSError):
             # Reserva oficial: contratações publicadas nos últimos dias, que o
             # PNCP serve por outra operação e costuma manter no ar.
-            raw, stamps = future_records(states, refresh, days=FALLBACK_WINDOW_DAYS)
+            raw, stamps = fallback_records(states, refresh)
             available = len(raw)
             FETCH_STATE.fallback = True
         else:
@@ -629,7 +794,8 @@ def fetch_opportunities(params):
             continue
         seen.add(record["id"])
         unique.append(record)
-    if unique:
+    if unique and not getattr(FETCH_STATE, "fallback", False):
+        # A reserva já grava cada edital quando ele chega, no coletor.
         persist_opportunities(unique)
 
     current_time = datetime.now()
@@ -676,7 +842,9 @@ def fetch_opportunities(params):
         records.sort(key=lambda r: r["sessao"] or "", reverse=True)
 
     filtered_total = len(records)
-    if local_filters:
+    if local_filters or getattr(FETCH_STATE, "fallback", False):
+        # Na reserva a lista vem inteira daqui: paginar é o que permite mostrar
+        # milhares de contratações sem devolver tudo numa resposta só.
         pages = max(1, -(-filtered_total // PAGE_SIZE))
         start = (page - 1) * PAGE_SIZE
         page_records = records[start:start + PAGE_SIZE]
@@ -693,8 +861,10 @@ def fetch_opportunities(params):
                "updated_at": datetime.fromtimestamp(data_stamp).isoformat(timespec="seconds")}
     if fallback:
         payload["warning"] = ("A consulta de propostas abertas do PNCP não respondeu agora. "
-                              f"Exibindo as contratações publicadas nos últimos {FALLBACK_WINDOW_DAYS} dias, "
-                              "com as datas oficiais de cada uma.")
+                              f"Exibindo as {filtered_total} contratações publicadas nos últimos "
+                              f"{FALLBACK_WINDOW_DAYS} dias que ainda recebem propostas, "
+                              "com as datas oficiais de cada uma. "
+                              "A lista cresce sozinha em segundo plano enquanto o PNCP não voltar.")
     return payload
 
 def persist_opportunities(records):
@@ -1467,4 +1637,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     print(f"Licitara disponível em http://{host}:{port}")
     threading.Thread(target=warm_pncp_cache, daemon=True, name="pncp-cache-refresh").start()
+    threading.Thread(target=fallback_collector, daemon=True, name="pncp-fallback-collector").start()
     ThreadingHTTPServer((host, port), Handler).serve_forever()

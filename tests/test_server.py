@@ -21,6 +21,10 @@ class PublicApiTests(unittest.TestCase):
         server.ITEMS_CACHE.clear()
         server.INDEX_CACHE.clear()
         server.PROPOSTA_DOWN_UNTIL = 0.0
+        server.FALLBACK_STORE.clear()
+        server.FALLBACK_CURSOR = 0
+        server.FALLBACK_LAST_NEEDED = 0.0
+        server.FALLBACK_SEEDED = False
         server.init_db()
         self.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -35,6 +39,8 @@ class PublicApiTests(unittest.TestCase):
         server.DB_PATH = self.old_db_path
         server.API_CACHE.clear()
         server.PROPOSTA_DOWN_UNTIL = 0.0
+        server.FALLBACK_STORE.clear()
+        server.FALLBACK_CURSOR = 0
         self.temp_dir.cleanup()
 
     def request(self, path, payload=None):
@@ -127,6 +133,44 @@ class PublicApiTests(unittest.TestCase):
         self.assertTrue(result["fallback"], result)
         self.assertEqual([r["id"] for r in result["opportunities"]], ["555-1-9/2026"])
         self.assertIn("warning", result)
+
+    def test_fallback_collects_pages_beyond_the_first_and_paginates(self):
+        deadline = (datetime.now() + timedelta(days=5)).isoformat(timespec="seconds")
+
+        def record(day, code, page, index):
+            return {"numeroControlePNCP": f"{day}-{code:08d}-{page}-{index}/2026",
+                    "objetoCompra": "Objeto recente", "modalidadeNome": "Pregão Eletrônico",
+                    "dataAberturaProposta": deadline, "dataEncerramentoProposta": deadline,
+                    "valorTotalEstimado": 10.0,
+                    "orgaoEntidade": {"razaoSocial": "Órgão", "cnpj": "555"},
+                    "unidadeOrgao": {"ufSigla": "SC", "municipioNome": "Florianópolis"}}
+
+        def fake_fetch(url):
+            if "contratacoes/proposta" in url:
+                raise urllib.error.URLError("sem resposta")
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            code = int(query["codigoModalidadeContratacao"][0])
+            page = int(query["pagina"][0])
+            day = query["dataInicial"][0]
+            return {"data": [record(day, code, page, i) for i in range(50)],
+                    "totalRegistros": 5600, "totalPaginas": 16}
+
+        with patch.object(server, "fetch_json", side_effect=fake_fetch), \
+                patch.object(server, "FALLBACK_PACE", 0.0):
+            first = server.fetch_opportunities({"products": [], "sort": "date", "page": 1})
+            for _ in range(3):
+                server.collect_fallback_pages(max_requests=8)
+            second = server.fetch_opportunities({"products": [], "sort": "date", "page": 1})
+            third = server.fetch_opportunities({"products": [], "sort": "date", "page": 2})
+        self.assertTrue(first["fallback"], first)
+        self.assertEqual(len(first["opportunities"]), server.PAGE_SIZE)
+        self.assertEqual(len(second["opportunities"]), server.PAGE_SIZE)
+        self.assertEqual(second["total"], third["total"])
+        self.assertGreater(second["total"], 250)
+        self.assertEqual(second["pages"], -(-second["total"] // server.PAGE_SIZE))
+        self.assertNotEqual({r["id"] for r in second["opportunities"]},
+                            {r["id"] for r in third["opportunities"]})
+        self.assertIn("cresce sozinha", second["warning"])
 
     def test_future_search_reports_a_pncp_failure(self):
         with patch.object(server, "cached_json", side_effect=urllib.error.URLError("limite")):
